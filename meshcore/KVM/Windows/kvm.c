@@ -714,6 +714,21 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 			SCREEN_SEL_TARGET = x;
 		break;
 	}
+	case MNG_KVM_PRIORITY_MODE:
+	{
+		// Priorité à l'utilisateur (§ 9.2) : le navigateur bascule le mode (0 = utilisateur, 1 = technicien).
+		// On applique localement et on accuse le mode courant vers le navigateur (confirme aussi un agent « neuf »).
+		if (size == 5)
+		{
+			unsigned char buffer[5];
+			Priority_SetMode((int)(unsigned char)block[4]);
+			((unsigned short *)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_PRIORITY_MODE); // type
+			((unsigned short *)buffer)[1] = (unsigned short)htons((unsigned short)5);					 // size
+			buffer[4] = (unsigned char)Priority_GetMode();											         // mode courant
+			writeHandler((char *)buffer, 5, reserved);
+		}
+		break;
+	}
 	}
 	return size;
 }
@@ -925,6 +940,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
+	Priority_Reset(); // nouvelle session KVM : aucun appui tenu côté poste (mode par défaut = utilisateur)
 
 #ifdef _WINSERVICE
 	if (!kvmConsoleMode)
@@ -1048,6 +1064,11 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 						mouseMove[2] = ((long *)tmoBuffer)[2] - SCREEN_Y;
 					}
 				}
+				// Priorité à l'utilisateur (§ 9.2) : on émet aussi la position (89) vers le navigateur — jusqu'ici
+				// seulement consommée pour dessiner le curseur dans l'image. Le Hub reflète alors le vrai état et peut
+				// dessiner le pointeur de l'utilisateur. Position absolue de l'écran Windows, telle quelle (x,y int32).
+				// Un client qui ne connaît pas le 89 (visualiseur MeshCentral d'origine) l'ignore : ajout optionnel.
+				writeHandler(tmoBuffer, (int)ILibMemory_Size(tmoBuffer), reserved);
 			}
 			else
 			{

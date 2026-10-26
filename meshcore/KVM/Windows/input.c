@@ -35,6 +35,130 @@ extern int gRemoteMouseMoved;
 uint64_t gMouseInputTime = 0;
 int gCurrentCursor = KVM_MouseCursor_HELP;
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Priorité à l'utilisateur du poste (Senpli, cahier des charges prise en main § 9.2).
+//
+// Par défaut, l'utilisateur physique du poste garde la main : dès qu'il touche sa souris ou son clavier, les entrées
+// que nous injectons (SendInput) sont ABANDONNÉES localement, sans aucune course réseau. Le technicien peut prendre la
+// priorité (MNG_KVM_PRIORITY_MODE, 1 = technicien) : ses entrées passent alors toujours, comme avant ce correctif.
+//
+// La vraie activité locale est détectée par deux hooks bas niveau (WH_MOUSE_LL / WH_KEYBOARD_LL) posés dans le thread à
+// message de la session KVM. Nos propres SendInput portent le drapeau LLMHF_INJECTED / LLKHF_INJECTED : ils ne comptent
+// donc PAS comme activité utilisateur. Le code tourne dans le process esclave (-kvm1), en SYSTEM mais dans la session de
+// l'utilisateur : les hooks bas niveau y voient bien l'entrée physique.
+
+#ifndef LLMHF_INJECTED
+#define LLMHF_INJECTED 0x00000001
+#endif
+#ifndef LLKHF_INJECTED
+#define LLKHF_INJECTED 0x00000010
+#endif
+
+// Délai pendant lequel l'utilisateur garde la main après son dernier geste physique. Réglable ici.
+#define PRIORITY_USER_HOLD_MS 1000
+
+// 0 = utilisateur (défaut), 1 = technicien. Par session KVM : une nouvelle session repart en 0 (process esclave neuf).
+static volatile LONG gPriorityMode = 0;
+// Horodatage (ILibGetUptime, ms) du dernier geste physique NON injecté de l'utilisateur du poste.
+static volatile uint64_t gUserInputTime = 0;
+
+// Ensemble des entrées que NOUS avons réellement enfoncées sur le poste : un relâchement d'un appui qui est parti doit
+// toujours passer, pour ne jamais laisser une touche ou un bouton collé quand la priorité bascule en plein appui.
+static int gDownMouse[3] = { 0, 0, 0 };				// 0 = gauche, 1 = droit, 2 = milieu
+static unsigned char gDownKey[256] = { 0 };			// par code virtuel (VK)
+static int gTouchInjecting = 0;						// un geste tactile de nous est en cours (pour le finir proprement)
+
+void Priority_SetMode(int mode) { gPriorityMode = (mode != 0) ? 1 : 0; }
+int Priority_GetMode(void) { return (int)gPriorityMode; }
+
+// L'utilisateur du poste a-t-il la main en ce moment ? (mode utilisateur ET geste physique récent)
+static int Priority_UserHasHand(void)
+{
+	if (gPriorityMode != 0) return 0;
+	return (((uint64_t)ILibGetUptime() - gUserInputTime) < PRIORITY_USER_HOLD_MS) ? 1 : 0;
+}
+
+// Les masques MOUSEEVENTF d'appui / de relâchement, par bouton (gauche, droit, milieu).
+static const int MOUSE_DOWN_FLAG[3] = { MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN };
+static const int MOUSE_UP_FLAG[3]   = { MOUSEEVENTF_LEFTUP,   MOUSEEVENTF_RIGHTUP,   MOUSEEVENTF_MIDDLEUP };
+
+// Faut-il injecter cette action souris ? Tient le compte des boutons réellement enfoncés côté poste.
+// button : masque MOUSEEVENTF venu du message (block[5]). wheel != 0 : molette.
+static int Priority_GateMouse(int button, short wheel)
+{
+	int i, isDown = 0, isUp = 0, btn = -1, hand = Priority_UserHasHand();
+	for (i = 0; i < 3; i++)
+	{
+		if (button & MOUSE_DOWN_FLAG[i]) { isDown = 1; btn = i; }
+		if (button & MOUSE_UP_FLAG[i])   { isUp = 1;   btn = i; }
+	}
+	if (isUp && btn >= 0)
+	{
+		// Le relâchement d'un bouton que nous avions enfoncé passe toujours (rien ne reste collé).
+		if (gDownMouse[btn]) { gDownMouse[btn] = 0; return 1; }
+		return hand ? 0 : 1;
+	}
+	if (isDown && btn >= 0)
+	{
+		if (hand) return 0;
+		gDownMouse[btn] = 1;
+		return 1;
+	}
+	// Déplacement pur ou molette : jamais d'état à tenir.
+	(void)wheel;
+	return hand ? 0 : 1;
+}
+
+// up : 0 = appui, 1 = relâchement, 3 = relâchement étendu, 4 = appui étendu (cf. KeyAction).
+static int Priority_GateKey(unsigned char keycode, int up)
+{
+	int hand = Priority_UserHasHand();
+	int isUp = (up == 1 || up == 3);
+	if (isUp)
+	{
+		if (gDownKey[keycode]) { gDownKey[keycode] = 0; return 1; }
+		return hand ? 0 : 1;
+	}
+	if (hand) return 0;
+	gDownKey[keycode] = 1;
+	return 1;
+}
+
+// Touche Unicode : up 0 = appui, 1 = relâchement. Suivi à part (code > 255), gate simple.
+static int Priority_GateUnicode(int up)
+{
+	int hand = Priority_UserHasHand();
+	// Un relâchement passe toujours s'il suit un appui déjà parti (approché : on ne retient que « la main »).
+	if (up == 1) return 1;
+	return hand ? 0 : 1;
+}
+
+// Geste tactile : on laisse finir un geste déjà commencé ; sinon on le bloque pendant que l'utilisateur a la main.
+// isDownOrUpdate : le contact touche l'écran (down/update) ; isUp : il le quitte.
+static int Priority_GateTouch(int isUp)
+{
+	int hand = Priority_UserHasHand();
+	if (isUp)
+	{
+		if (gTouchInjecting) { gTouchInjecting = 0; return 1; }
+		return hand ? 0 : 1;
+	}
+	if (gTouchInjecting) return 1;			// on finit le geste en cours
+	if (hand) return 0;
+	gTouchInjecting = 1;
+	return 1;
+}
+
+// Fin de session / changement de bureau : plus rien n'est tenu enfoncé côté poste.
+void Priority_Reset(void)
+{
+	int i;
+	for (i = 0; i < 3; i++) gDownMouse[i] = 0;
+	for (i = 0; i < 256; i++) gDownKey[i] = 0;
+	gTouchInjecting = 0;
+}
+// ---------------------------------------------------------------------------------------------------------------------
+
 HWINEVENTHOOK CUR_HOOK = NULL;
 WNDCLASSEXA CUR_WNDCLASS;
 HWND CUR_HWND = NULL;
@@ -289,10 +413,31 @@ void KVM_PumpMessage()
 	}
 }
 
+// Hook bas niveau souris : repère l'activité PHYSIQUE de l'utilisateur du poste (hors nos SendInject).
+LRESULT CALLBACK KVM_MouseLLProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+	if (nCode == HC_ACTION)
+	{
+		MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+		if (p != NULL && (p->flags & LLMHF_INJECTED) == 0)
+		{
+			// Un vrai geste de l'utilisateur, pas une de nos injections : il garde / reprend la main.
+			gUserInputTime = (uint64_t)ILibGetUptime();
+		}
+	}
+	return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
 	if (nCode == HC_ACTION)
 	{
+		PKBDLLHOOKSTRUCT pk = (PKBDLLHOOKSTRUCT)lParam;
+		if (pk != NULL && (pk->flags & LLKHF_INJECTED) == 0)
+		{
+			// Frappe physique de l'utilisateur (pas une de nos injections) : il garde / reprend la main.
+			gUserInputTime = (uint64_t)ILibGetUptime();
+		}
 		switch (wParam)
 		{
 			case WM_KEYUP:
@@ -333,12 +478,14 @@ DWORD WINAPI KVM_InitMessagePumpEx(LPVOID parm)
 	if ((a=RegisterClassExA(&CUR_WNDCLASS)) != 0)
 	{
 		HHOOK hhkLowLevelKybd = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, 0, 0);
+		HHOOK hhkLowLevelMouse = SetWindowsHookEx(WH_MOUSE_LL, KVM_MouseLLProc, 0, 0);
 
 		CUR_HWND = CreateWindowExA(0x00000088, "MainWWW2Class", "TestTitle", 0x00800000, 0, 0, 100, 100, 0, 0, 0, 0);
 		KVM_PumpMessage();
 		DestroyWindow(CUR_HWND);
 		CUR_HWND = NULL;
 
+		if (hhkLowLevelMouse != NULL) UnhookWindowsHookEx(hhkLowLevelMouse);
 		UnhookWindowsHookEx(hhkLowLevelKybd);
 		UnregisterClassA((LPCSTR)a, GetModuleHandleA(NULL));
 	}
@@ -393,6 +540,8 @@ void MouseAction(double absX, double absY, int button, short wheel)
 {
 	INPUT mouse;
 	if (button == 0x88) return; // Double click indication, no nothing on windows.
+	// Priorité à l'utilisateur : notre entrée est abandonnée s'il a la main (§ 9.2).
+	if (!Priority_GateMouse(button, wheel)) return;
 	mouse.type = INPUT_MOUSE;
 	mouse.mi.dx = (long)absX;
 	mouse.mi.dy = (long)absY;
@@ -408,7 +557,10 @@ void MouseAction(double absX, double absY, int button, short wheel)
 void KeyAction(unsigned char keycode, int up)
 {
 	INPUT key;
-	HWND windowHandle = GetForegroundWindow();
+	HWND windowHandle;
+	// Priorité à l'utilisateur : notre frappe est abandonnée s'il a la main (§ 9.2).
+	if (!Priority_GateKey(keycode, up)) return;
+	windowHandle = GetForegroundWindow();
 	if (windowHandle == NULL) return;
 	SetForegroundWindow(windowHandle);
 	key.type = INPUT_KEYBOARD;
@@ -427,7 +579,10 @@ void KeyAction(unsigned char keycode, int up)
 void KeyActionUnicode(WORD unicode, int up)
 {
 	INPUT key;
-	HWND windowHandle = GetForegroundWindow();
+	HWND windowHandle;
+	// Priorité à l'utilisateur : notre frappe Unicode est abandonnée s'il a la main (§ 9.2).
+	if (!Priority_GateUnicode(up)) return;
+	windowHandle = GetForegroundWindow();
 	if (windowHandle == NULL) return;
 	SetForegroundWindow(windowHandle);
 	key.type = INPUT_KEYBOARD;
@@ -583,6 +738,8 @@ int TouchAction1(unsigned char id, unsigned int flags, unsigned short x, unsigne
 	POINTER_TOUCH_INFO contact;
 
 	if (g_TouchLoadLibraryState != 1) return 0;
+	// Priorité à l'utilisateur : le geste tactile est abandonné s'il a la main (§ 9.2).
+	if (!Priority_GateTouch((flags & POINTER_FLAG_UP) != 0)) return 0;
 	MakeTouchObject(&contact, id, (POINTER_FLAGS)flags, x, y);
 	if (!g_TouchInjectionCall(1, &contact)) { printf("TOUCH1ERROR: id=%u, flags=%u, x=%u, y=%u, err=%ld\r\n", id, flags, x, y, GetLastError()); return 1; }
 
@@ -592,12 +749,20 @@ int TouchAction1(unsigned char id, unsigned int flags, unsigned short x, unsigne
 
 int TouchAction2(char* data, int datalen, int scaling)
 {
-	int i, records = datalen / 9;
+	int i, records = datalen / 9, anyUp = 0, anyDown = 0;
 	POINTER_TOUCH_INFO contact[16];
 
 	if (g_TouchLoadLibraryState != 1) return 0;
 
 	if (records > 16) records = 16;
+	// Priorité à l'utilisateur : on regarde si ce lot contient un relâchement (à laisser passer pour ne rien coller).
+	for (i = 0; i < records; i++)
+	{
+		int f = (int)ntohl(((unsigned int*)(data + (9 * i) + 1))[0]);
+		if (f & POINTER_FLAG_UP) anyUp = 1; else anyDown = 1;
+	}
+	if (anyUp && !anyDown) { if (!Priority_GateTouch(1)) return 0; }
+	else if (!Priority_GateTouch(0)) return 0;
 	for (i = 0; i < records; i++) {
 		int flags = (int)ntohl(((unsigned int*)(data + (9 * i) + 1))[0]);
 		int x = (int)(ntohs(((unsigned short*)(data + (9 * i) + 5))[0]));

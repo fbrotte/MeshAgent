@@ -31,6 +31,9 @@ typedef enum RemoteManagementCommands
 	MNG_KVM_MOUSE = 2,
 	MNG_KVM_MOUSE_CURSOR = 88,
 	MNG_KVM_MOUSE_MOVE = 89,
+	MNG_KVM_PRIORITY_MODE = 90,				// Senpli (prise en main) : priorité d'entrée par session KVM, navigateur <-> agent
+											// 1 octet de charge utile : 0 = utilisateur (defaut), 1 = technicien.
+											// Navigateur -> agent : bascule le mode. Agent -> navigateur : accuse le mode courant.
 	MNG_KVM_PICTURE = 3,
 	MNG_KVM_COPY = 4,
 	MNG_KVM_COMPRESSION = 5,

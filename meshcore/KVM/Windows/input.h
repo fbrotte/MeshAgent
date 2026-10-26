@@ -40,6 +40,10 @@ typedef enum KVM_MouseCursors
 
 void KVM_InitMouseCursors(void* pendingPackets);
 void KVM_UnInitMouseCursors();
+// Priorité à l'utilisateur du poste (cahier des charges prise en main § 9.2).
+void Priority_SetMode(int mode);	// 0 = utilisateur (defaut), 1 = technicien
+int  Priority_GetMode(void);
+void Priority_Reset(void);			// vide les appuis tenus (fin de session / changement de bureau)
 void MouseAction(double absX, double absY, int button, short wheel);
 void KeyAction(unsigned char keycode, int up);
 void KeyActionUnicode(WORD unicode, int up);
