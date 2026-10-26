@@ -1,0 +1,48 @@
+name: build-windows-x64
+
+# Builds the Windows x64 MeshAgent service (MeshService64.exe) with MSVC on a
+# GitHub-hosted runner. OpenSSL is vendored pre-compiled as static libs in the
+# repo, so no extra toolchain setup is needed beyond VS 2022, which windows-latest
+# already carries.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - sans-safeboot
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Re-embed JS modules into ILibDuktape_Polyfills.c
+        shell: pwsh
+        run: |
+          python .github/scripts/embed-modules.py
+          git --no-pager diff --stat
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2.0.0
+
+      - name: Build MeshService64.exe (Release x64)
+        shell: pwsh
+        run: |
+          msbuild MeshAgent-2022.sln /t:MeshService-2022 /p:Configuration=Release /p:Platform=x64 /m /nologo
+
+      - name: Locate binary
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter MeshService64.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "MeshService64.exe not found"; exit 1 }
+          Write-Host "Found: $($exe.FullName)  ($($exe.Length) bytes)"
+          "MESH_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: MeshService64
+          path: ${{ env.MESH_EXE }}
+          if-no-files-found: error

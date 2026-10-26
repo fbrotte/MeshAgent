@@ -291,8 +291,14 @@ function installService(params)
         process.stdout.write(' [DONE]\n');
         if(process.platform == 'win32')
         {
-            // On Windows, we're going to enable this service to be runnable from SafeModeWithNetworking
-            require('win-bcd').enableSafeModeService(options.name);
+            // On Windows, enabling the service to run in SafeModeWithNetworking requires writing the
+            // registry key HKLM\SYSTEM\CurrentControlSet\Control\Safeboot\Network\<service>. Combined
+            // with an auto-start service, Microsoft Defender flags this as Behavior:Win32/Persistence.A!ml
+            // and removes the agent. It is therefore opt-in: pass --safeMode="1" at install to enable it.
+            if (params.indexOf('--safeMode="1"') >= 0)
+            {
+                require('win-bcd').enableSafeModeService(options.name);
+            }
         }
     }
     catch(sie)
