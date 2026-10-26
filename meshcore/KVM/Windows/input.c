@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <Windows.h>
 #include <Winuser.h>
+#include <sddl.h>
 #include <stdio.h>
 #include "input.h"
 
@@ -156,6 +157,96 @@ void Priority_Reset(void)
 	for (i = 0; i < 3; i++) gDownMouse[i] = 0;
 	for (i = 0; i < 256; i++) gDownKey[i] = 0;
 	gTouchInjecting = 0;
+}
+// ---------------------------------------------------------------------------------------------------------------------
+// Pointeur du technicien montré chez l'utilisateur (Senpli, cahier des charges prise en main § 9.2 B).
+//
+// On ne PREND PAS la main, on MONTRE : le navigateur envoie la position visée du technicien (MNG_KVM_SHOW_POINTER = 91),
+// MÊME quand nos entrées sont abandonnées par la priorité à l'utilisateur — c'est tout l'intérêt (montrer sans prendre
+// la main). L'agent la RELAIE au process du bandeau (l'overlay), qui tourne dans la session de l'utilisateur, par une
+// mémoire partagée nommée ; il n'injecte jamais cette position (le vrai curseur de l'utilisateur ne bouge pas). Le
+// bandeau y lit la position et y dessine un pointeur fantôme à la couleur de la marque.
+//
+// Pourquoi ce canal (et pas MouseAction) : en mode « montrer » (utilisateur prioritaire, le défaut), le visualiseur
+// n'ENVOIE même pas nos déplacements (suppression locale, input-priority.ts) — l'agent ne les verrait donc jamais dans
+// MouseAction. Un message dédié, lu hors du chemin d'injection, montre le pointeur quel que soit l'état de la priorité.
+//
+// Le process esclave (-kvm1) tourne en SYSTEM DANS la session de l'utilisateur : sa section « Local\ » vit dans l'espace
+// de noms de CETTE session, le même que celui du bandeau (lancé AS THE USER par runcommands). On la crée en écrivain,
+// avec un descripteur de sécurité qui donne la lecture à tout le monde (le bandeau est moins privilégié) et tout à SYSTEM.
+
+#define SHOWPTR_MAGIC 0x52545053      // 'SPTR', petit-boutiste : sanité + version
+#define SHOWPTR_VERSION 1
+#define SHOWPTR_NAME L"Local\\DimoraAssistPointer"
+
+// Disposition de la mémoire partagée — lue à l'identique par le bandeau (C#). Champs 32 bits alignés (lecture/écriture
+// atomiques sur x86) ; `seq` est un seqlock : impair = écriture en cours, pair = stable, pour une paire (x,y) cohérente.
+typedef struct ShowPointerShared
+{
+	volatile unsigned int magic;
+	volatile unsigned int version;
+	volatile unsigned int seq;
+	volatile int x;
+	volatile int y;
+	volatile unsigned int visible;
+	volatile unsigned int reserved;
+} ShowPointerShared;
+
+static HANDLE gShowPtrMap = NULL;
+static ShowPointerShared *gShowPtr = NULL;
+
+// Crée (une seule fois) la section partagée. Rend 1 si prête. Sans échec bruyant : à défaut, on ne montre rien.
+static int ShowPointer_Ensure(void)
+{
+	SECURITY_ATTRIBUTES sa;
+	if (gShowPtr != NULL) return 1;
+	ZeroMemory(&sa, sizeof(sa));
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = FALSE;
+	// Tout le monde (WD) en lecture/écriture générique, SYSTEM (SY) en tout : le bandeau, process utilisateur, peut lire.
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+			L"D:(A;;GRGW;;;WD)(A;;GA;;;SY)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL))
+		sa.lpSecurityDescriptor = NULL; // à défaut : DACL par défaut (au pire, le bandeau ne lit pas, pas de fantôme)
+	gShowPtrMap = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(ShowPointerShared), SHOWPTR_NAME);
+	if (sa.lpSecurityDescriptor != NULL) LocalFree(sa.lpSecurityDescriptor);
+	if (gShowPtrMap == NULL) return 0;
+	gShowPtr = (ShowPointerShared *)MapViewOfFile(gShowPtrMap, FILE_MAP_WRITE, 0, 0, sizeof(ShowPointerShared));
+	if (gShowPtr == NULL) { CloseHandle(gShowPtrMap); gShowPtrMap = NULL; return 0; }
+	gShowPtr->seq = 0;
+	gShowPtr->x = 0;
+	gShowPtr->y = 0;
+	gShowPtr->visible = 0;
+	gShowPtr->reserved = 0;
+	gShowPtr->version = SHOWPTR_VERSION;
+	gShowPtr->magic = SHOWPTR_MAGIC; // posé en dernier : tant qu'il n'est pas là, le bandeau ne lit pas la section
+	return 1;
+}
+
+// Relaie une position (ou un masquage) à l'overlay. x,y en pixels du bureau virtuel Windows (comme le 89). visible 0/1.
+void ShowPointer_Set(int x, int y, int visible)
+{
+	if (!ShowPointer_Ensure()) return;
+	gShowPtr->seq++;            // impair : écriture en cours
+	MemoryBarrier();
+	gShowPtr->x = x;
+	gShowPtr->y = y;
+	gShowPtr->visible = (visible != 0) ? 1u : 0u;
+	MemoryBarrier();
+	gShowPtr->seq++;            // pair : paire (x,y,visible) stable
+}
+
+// Fin de session KVM : on cache (si une poignée du bandeau tient encore) puis on ferme le canal.
+void ShowPointer_Cleanup(void)
+{
+	if (gShowPtr != NULL)
+	{
+		gShowPtr->visible = 0;
+		MemoryBarrier();
+		gShowPtr->seq++;
+		UnmapViewOfFile((LPVOID)gShowPtr);
+		gShowPtr = NULL;
+	}
+	if (gShowPtrMap != NULL) { CloseHandle(gShowPtrMap); gShowPtrMap = NULL; }
 }
 // ---------------------------------------------------------------------------------------------------------------------
 

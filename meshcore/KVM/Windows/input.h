@@ -44,6 +44,10 @@ void KVM_UnInitMouseCursors();
 void Priority_SetMode(int mode);	// 0 = utilisateur (defaut), 1 = technicien
 int  Priority_GetMode(void);
 void Priority_Reset(void);			// vide les appuis tenus (fin de session / changement de bureau)
+// Pointeur du technicien montré chez l'utilisateur (§ 9.2 B) : position relayée à l'overlay (bandeau) par mémoire
+// partagée, jamais injectée. visible : 1 = montrer, 0 = cacher. Cleanup ferme le canal (fin de session KVM).
+void ShowPointer_Set(int x, int y, int visible);
+void ShowPointer_Cleanup(void);
 void MouseAction(double absX, double absY, int button, short wheel);
 void KeyAction(unsigned char keycode, int up);
 void KeyActionUnicode(WORD unicode, int up);

@@ -34,6 +34,12 @@ typedef enum RemoteManagementCommands
 	MNG_KVM_PRIORITY_MODE = 90,				// Senpli (prise en main) : priorité d'entrée par session KVM, navigateur <-> agent
 											// 1 octet de charge utile : 0 = utilisateur (defaut), 1 = technicien.
 											// Navigateur -> agent : bascule le mode. Agent -> navigateur : accuse le mode courant.
+	MNG_KVM_SHOW_POINTER = 91,				// Senpli (prise en main § 9.2 B) : position du pointeur du technicien à MONTRER
+											// chez l'utilisateur (pointeur fantôme AnyDesk), navigateur -> agent. 9 octets :
+											// x (int32), y (int32) en pixels du bureau virtuel Windows (ordre de l'hote,
+											// comme le 89), puis 1 octet visible (1 = montrer, 0 = cacher). L'agent relaie la
+											// position au process du bandeau (overlay) dans la session de l'utilisateur, sans
+											// jamais l'injecter : on montre sans prendre la main. Sens unique (pas d'accusé).
 	MNG_KVM_PICTURE = 3,
 	MNG_KVM_COPY = 4,
 	MNG_KVM_COMPRESSION = 5,

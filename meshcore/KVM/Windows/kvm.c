@@ -729,6 +729,19 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 		}
 		break;
 	}
+	case MNG_KVM_SHOW_POINTER:
+	{
+		// Pointeur du technicien à MONTRER chez l'utilisateur (§ 9.2 B) : on relaie la position à l'overlay (bandeau),
+		// sans JAMAIS l'injecter. 9 octets : x (int32), y (int32), visible (1 octet). x,y en pixels du bureau virtuel,
+		// dans l'ordre de l'hote (petit-boutiste sur x86, comme le 89) : lus tels quels.
+		if (size == 13)
+		{
+			int px = ((int *)(block + 4))[0];
+			int py = ((int *)(block + 8))[0];
+			ShowPointer_Set(px, py, (int)(unsigned char)block[12]);
+		}
+		break;
+	}
 	}
 	return size;
 }
@@ -1233,6 +1246,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	KVMDEBUG("kvm_server_mainloop / end", (int)GetCurrentThreadId());
 
 	KVM_UnInitMouseCursors();
+	ShowPointer_Cleanup(); // fin de session KVM : on ferme le canal du pointeur montré (le bandeau le voit disparaitre)
 
 	while ((tmoBuffer = ILibQueue_DeQueue(gPendingPackets)) != NULL)
 	{

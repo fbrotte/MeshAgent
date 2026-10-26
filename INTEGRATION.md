@@ -39,6 +39,38 @@ régression visuelle). Charge utile : `x` puis `y`, deux entiers 32 bits signés
 (petit-boutiste sur x86), position absolue du bureau Windows. Le Hub reflète ainsi le vrai état et
 dessine le pointeur de l'utilisateur.
 
+### Nouveau : `MNG_KVM_SHOW_POINTER = 91` (navigateur → agent) — partie B, § 9.2 B
+
+Charge utile : **9 octets** — `x` (int32), `y` (int32) en **pixels du bureau virtuel Windows** (dans l'ordre de
+l'hote, petit-boutiste sur x86, **comme le 89**), puis **1 octet** `visible` (`1` = montrer, `0` = cacher). Taille
+totale 13. Sens unique (pas d'accusé).
+
+C'est **le pointeur du technicien à MONTRER chez l'utilisateur**, comme AnyDesk : un pointeur fantôme, à la couleur de
+la marque, qui se déplace sur l'écran de l'utilisateur **en plus du sien**, pour lui montrer des choses **sans prendre
+la main**. Le navigateur l'envoie (throttlé) tant qu'on est en mode « montrer » (par défaut : l'utilisateur est
+prioritaire). L'agent **ne l'injecte jamais** : il le **relaie** au process du bandeau (l'overlay) dans la session de
+l'utilisateur, par une **mémoire partagée nommée** (`Priority_SetMode` n'a rien à voir ; cf. `ShowPointer_Set` dans
+`input.c`).
+
+**Pourquoi un message dédié, et pas la position de `MouseAction` (source i du cahier des charges)** : en mode
+« montrer », le visualiseur n'**envoie** même pas nos déplacements (suppression locale, `input-priority.ts`) — l'agent
+ne les verrait donc jamais passer dans `MouseAction`. Et le but est justement de montrer **quand nos entrées sont
+abandonnées**. Un canal dédié, lu **hors du chemin d'injection**, affiche le pointeur quel que soit l'état de la
+priorité. Le navigateur calcule la position absolue (bureau virtuel) en **inversant** la transformation déjà validée du
+89 (`remoteToCanvas` → `canvasToRemote`) ; l'agent la relaie **telle quelle**, sans conversion.
+
+### Le canal agent → overlay : une mémoire partagée nommée
+
+Le process esclave (`-kvm1`) tourne en SYSTEM **dans la session de l'utilisateur** ; le bandeau tourne **AS THE USER**
+dans la même session (`runcommands`, tâche planifiée). L'agent (écrivain) **crée** une section nommée
+`Local\DimoraAssistPointer` — l'espace de noms `Local\` est **celui de la session**, partagé par les deux — avec un
+descripteur de sécurité qui donne la lecture à tout le monde et tout à SYSTEM (le bandeau est moins privilégié). Le
+bandeau (lecteur) l'ouvre et lit à ~30 Hz. Disposition : `magic` (`'SPTR'`), `version`, `seq` (seqlock : impair =
+écriture en cours, pour une paire `x,y` cohérente), `x`, `y`, `visible`, le tout en 32 bits. À la **fin de la session
+KVM**, `ShowPointer_Cleanup` met `visible = 0` et ferme la section : le bandeau cache le fantôme, puis le voit
+disparaitre. Le bandeau cache aussi sur `visible = 0` explicite et sur **péremption** (`seq` figé > ~2 s) ; le navigateur
+réémet donc la dernière position en battement (~500 ms) tant qu'on montre, pour qu'un pointeur immobile reste affiché.
+
 ## Ce que fait l'agent (où)
 
 Tout est dans `meshcore/KVM/Windows/`, process **esclave** (`-kvm1`), qui tourne en SYSTEM **dans la
@@ -64,15 +96,21 @@ l'entrée physique.
 
 4. **Émission du 89** (`kvm.c`) : la position est transmise au navigateur (cf. ci-dessus).
 
+5. **Pointeur montré** (`input.c`, `ShowPointer_Set` / `ShowPointer_Cleanup`) : à la réception d'un 91
+   (`kvm_server_inputdata`), la position est écrite dans la mémoire partagée de la session, jamais injectée — l'overlay
+   du bandeau la lit et dessine le pointeur fantôme (partie B).
+
 **Ctrl+Alt+Suppr** n'est **jamais** gaté : il est traité en amont par le process maître
 (`kvm_relay_feeddata` → `SendSAS`, type `MNG_CTRLALTDEL` = 10), hors du chemin d'injection. Il reste donc
 toujours autorisé, quel que soit le mode — conforme à l'intention (§ 9.2).
 
 ## Compatibilité
 
-- **Ancien client (ne connaît pas le mode) ↔ nouvel agent** : aucun message 90 ne vient → l'agent reste
-  en **utilisateur** (défaut voulu). Le 89 émis en plus est ignoré par un visualiseur MeshCentral
-  d'origine (type inconnu).
+- **Ancien client (ne connaît pas le mode) ↔ nouvel agent** : aucun message 90 ni 91 ne vient → l'agent reste
+  en **utilisateur** (défaut voulu) et ne montre aucun pointeur. Le 89 émis en plus est ignoré par un visualiseur
+  MeshCentral d'origine (type inconnu).
+- **Nouveau client ↔ ancien agent, pour le 91** : l'ancien agent ignore le type inconnu (`kvm_server_inputdata` tombe
+  dans le `default` et renvoie `size`, rien n'est fait) → pas de pointeur montré, aucune casse.
 - **Nouveau client ↔ ancien agent** : l'ancien agent ignore le 90 et n'émet pas le 89. Le client
   continue de marcher ; il dégrade simplement vers « le technicien a toujours la main » (pas de priorité
   utilisateur, faute de signal), sans jamais rester bloqué.
